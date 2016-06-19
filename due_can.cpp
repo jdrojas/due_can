@@ -31,6 +31,9 @@ CANRaw::CANRaw(Can* pCan, uint32_t En ) {
 	m_pCan = pCan;
 	enablePin = En;
 	bigEndian = false;
+	busSpeed = 0;
+	
+	for (int i = 0; i < 4; i++) listener[i] = NULL;
 }
 
 /**
@@ -117,6 +120,10 @@ uint32_t CANRaw::begin(uint32_t baudrate, uint8_t enablePin)
 	return init(baudrate);
 }
 
+uint32_t CANRaw::getBusSpeed()
+{
+	return busSpeed;
+}
 
 /**
  * \brief Initialize CAN controller.
@@ -132,6 +139,10 @@ uint32_t CANRaw::init(uint32_t ul_baudrate)
 {
 	uint32_t ul_flag;
 	uint32_t ul_tick;
+	
+	//there used to be code here to cause this function to not run if the hardware is already initialized. But,
+	//it can be helpful to reinitialize. For instance, if the bus rate was set improperly you might need to
+	//go back through this code to reset the hardware.
 
 	//initialize all function pointers to null
 	for (int i = 0; i < 9; i++) cbCANFrame[i] = 0;
@@ -176,13 +187,22 @@ uint32_t CANRaw::init(uint32_t ul_baudrate)
 		ul_tick++;
 	}
 
+	//set a fairly low priority so almost anything can preempt.
+	//this has the effect that most anything can interrupt our interrupt handler
+	//that's a good thing because the interrupt handler is long and complicated
+	//and can send callbacks into user code which could also be long and complicated.
+	//But, keep in mind that user code in callbacks runs in interrupt context
+	//but can still be preempted at any time.
+	NVIC_SetPriority(m_pCan == CAN0 ? CAN0_IRQn : CAN1_IRQn, 12); 
+	
 	NVIC_EnableIRQ(m_pCan == CAN0 ? CAN0_IRQn : CAN1_IRQn); //tell the nested interrupt controller to turn on our interrupt
 
 	/* Timeout or the CAN module has been synchronized with the bus. */
 	if (CAN_TIMEOUT == ul_tick) {
 		return 0;
 	} else {
-		return 1;
+		busSpeed = ul_baudrate;
+		return busSpeed;
 	}
 }
 
@@ -190,8 +210,10 @@ uint32_t CANRaw::init(uint32_t ul_baudrate)
  *
  * \param txboxes How many of the 8 boxes should be used for TX
  *
+ * \retval number of tx boxes set.
+ *
  */
-void CANRaw::setNumTXBoxes(int txboxes) {
+int CANRaw::setNumTXBoxes(int txboxes) {
 	int c;
 
 	if (txboxes > 8) txboxes = 8;
@@ -211,6 +233,8 @@ void CANRaw::setNumTXBoxes(int txboxes) {
 		mailbox_set_priority(c, 10);
 		mailbox_set_accept_mask(c, 0x7FF, false);
 	}
+	
+	return (numTXBoxes);
 }
 
 /**
@@ -254,6 +278,32 @@ void CANRaw::detachCANInterrupt(uint8_t mailBox)
 	cbCANFrame[mailBox] = 0;
 }
 
+boolean CANRaw::attachObj(CANListener *listener)
+{
+	for (int i = 0; i < SIZE_LISTENERS; i++)
+	{
+		if (this->listener[i] == NULL)
+		{
+			this->listener[i] = listener;
+			listener->callbacksActive = 0;
+			return true;			
+		}
+	}
+	return false;
+}
+
+boolean CANRaw::detachObj(CANListener *listener)
+{
+	for (int i = 0; i < SIZE_LISTENERS; i++)
+	{
+		if (this->listener[i] == listener)
+		{
+			this->listener[i] = NULL;			
+			return true;			
+		}
+	}
+	return false;  
+}
 
 /**
  * \brief Enable CAN Controller.
@@ -517,10 +567,7 @@ void CANRaw::reset_internal_timer()
  */
 void CANRaw::global_send_transfer_cmd(uint8_t uc_mask)
 {
-	uint32_t ul_reg;
-
-	ul_reg = m_pCan->CAN_TCR & ((uint32_t)~GLOBAL_MAILBOX_MASK);
-	m_pCan->CAN_TCR = ul_reg | uc_mask;
+	m_pCan->CAN_TCR = uc_mask & GLOBAL_MAILBOX_MASK;
 }
 
 /**
@@ -660,35 +707,42 @@ template <typename t> void CANRaw::write(t inputValue)
  * \note Will do one of two things - 1. Send the given frame out of the first available mailbox
  * or 2. queue the frame for sending later via interrupt. Automatically turns on TX interrupt
  * if necessary.
+ * 
+ * Returns whether sending/queueing succeeded. Will not smash the queue if it gets full.
  */
-void CANRaw::sendFrame(CAN_FRAME& txFrame) 
+bool CANRaw::sendFrame(CAN_FRAME& txFrame) 
 {
-    for (int i = 0; i < 8; i++) {
-        if (((m_pCan->CAN_MB[i].CAN_MMR >> 24) & 7) == CAN_MB_TX_MODE)
-	{//is this mailbox set up as a TX box?
-	    if (m_pCan->CAN_MB[i].CAN_MSR & CAN_MSR_MRDY) 
-	    {//is it also available (not sending anything?)
-	        mailbox_set_id(i, txFrame.id, txFrame.extended);
-		mailbox_set_datalen(i, txFrame.length);
-		mailbox_set_priority(i, txFrame.priority);
-		for (uint8_t cnt = 0; cnt < 8; cnt++)
-		{    
-		    mailbox_set_databyte(i, cnt, txFrame.data.bytes[cnt]);
-		}       
-		enable_interrupt(0x01u << i); //enable the TX interrupt for this box
-		global_send_transfer_cmd((0x1u << i));
-		return; //we've sent it. mission accomplished.
-	    }
-	}
+	for (int i = 0; i < 8; i++) {
+		if (((m_pCan->CAN_MB[i].CAN_MMR >> 24) & 7) == CAN_MB_TX_MODE)
+		{//is this mailbox set up as a TX box?
+			if (m_pCan->CAN_MB[i].CAN_MSR & CAN_MSR_MRDY) 
+			{//is it also available (not sending anything?)
+				mailbox_set_id(i, txFrame.id, txFrame.extended);
+				mailbox_set_datalen(i, txFrame.length);
+				mailbox_set_priority(i, txFrame.priority);
+				for (uint8_t cnt = 0; cnt < 8; cnt++)
+				{    
+					mailbox_set_databyte(i, cnt, txFrame.data.bytes[cnt]);
+				}       
+				enable_interrupt(0x01u << i); //enable the TX interrupt for this box
+				global_send_transfer_cmd((0x1u << i));
+				return true; //we've sent it. mission accomplished.
+			}
+		}
     }
 	
     //if execution got to this point then no free mailbox was found above
-    //so, queue the frame.
+    //so, queue the frame if possible. But, don't increment the 
+	//tail if it would smash into the head and kill the queue.
+	uint8_t temp;
+	temp = (tx_buffer_tail + 1) % SIZE_TX_BUFFER;
+	if (temp == tx_buffer_head) return false;
     tx_frame_buff[tx_buffer_tail].id = txFrame.id;
     tx_frame_buff[tx_buffer_tail].extended = txFrame.extended;
     tx_frame_buff[tx_buffer_tail].length = txFrame.length;
     tx_frame_buff[tx_buffer_tail].data.value = txFrame.data.value;
-    tx_buffer_tail = (tx_buffer_tail + 1) % SIZE_TX_BUFFER;	
+    tx_buffer_tail = temp;
+	return true;
 }
 
 
@@ -791,7 +845,7 @@ uint32_t CANRaw::mailbox_get_id(uint8_t uc_index) {
  * \brief Set the transmission priority for given mailbox
  *
  * \param uc_index The mailbox to use
- * \param pri The priority to set (0-15 in ascending priority)
+ * \param pri The priority to set (0-15 in descending priority)
  *
  */
 void CANRaw::mailbox_set_priority(uint8_t uc_index, uint8_t pri) 
@@ -1083,6 +1137,7 @@ int CANRaw::setRXFilter(uint32_t id, uint32_t mask, bool extended) {
 /**
 * \brief Set up an RX mailbox (given MB number) filter
 *
+
 * \param mailbox Which mailbox to use (0-7)
 * \param id The ID to match against
 * \param mask The mask to apply before ID matching
@@ -1104,9 +1159,9 @@ int CANRaw::setRXFilter(uint8_t mailbox, uint32_t id, uint32_t mask, bool extend
 //quickly sets things up for all in. But, it's perfect for the novice getting started.
 int CANRaw::watchFor() 
 {
-	int retVal = setRXFilter(0, 0, false);
+	int retVal = setRXFilter(0, 0, 0, false);
 	enable_interrupt(getMailboxIer(0));
-	setRXFilter(0, 0, true);
+	setRXFilter(1, 0, 0, true);
 	enable_interrupt(getMailboxIer(1));
 
 	return retVal;
@@ -1128,11 +1183,13 @@ int CANRaw::watchFor(uint32_t id, uint32_t mask)
 
 //A bit more complicated. Makes sure that the range from id1 to id2 is let through. This might open
 //the floodgates if you aren't careful.
+//There are undoubtedly better ways to calculate the proper values for the filter but this way seems to work.
+//It'll be kind of slow if you try to let a huge span through though.
 int CANRaw::watchForRange(uint32_t id1, uint32_t id2)
 {
-	int id = 0;
-	int mask = 0;
-	int temp;
+	uint32_t id = 0;
+	uint32_t mask = 0;
+	uint32_t temp;
 
 	if (id1 > id2) 
 	{   //looks funny I know. In place swap with no temporary storage. Neato!
@@ -1157,7 +1214,7 @@ int CANRaw::watchForRange(uint32_t id1, uint32_t id2)
 	   this so that it is 1 anywhere the bits where the same. Then we AND with the current Mask.
 	   At the end the mask will be 1 anywhere the bits never changed. This is the perfect mask.
 	*/
-	for (int c = id1; c <= id2; c++)
+	for (uint32_t c = id1; c <= id2; c++)
 	{
 		id &= c;
 		temp = (~(id1 ^ c)) & 0x1FFFFFFF;
@@ -1201,9 +1258,12 @@ uint32_t CANRaw::getMailboxIer(int8_t mailbox) {
 * \brief Handle a mailbox interrupt event
 * \param mb which mailbox generated this event
 * \param ul_status The status register of the canbus hardware
+* 
 */
 void CANRaw::mailbox_int_handler(uint8_t mb, uint32_t ul_status) {
 	CAN_FRAME tempFrame;
+	boolean caughtFrame = false;
+	CANListener *thisListener;
 	if (mb > 7) mb = 7;
 	if (m_pCan->CAN_MB[mb].CAN_MSR & CAN_MSR_MRDY) { //mailbox signals it is ready
 		switch(((m_pCan->CAN_MB[mb].CAN_MMR >> 24) & 7)) { //what sort of mailbox is it?
@@ -1212,12 +1272,44 @@ void CANRaw::mailbox_int_handler(uint8_t mb, uint32_t ul_status) {
 		case 4: //consumer - technically still a receive buffer
 			mailbox_read(mb, &tempFrame);
 			//First, try to send a callback. If no callback registered then buffer the frame.
-			if (cbCANFrame[mb]) (*cbCANFrame[mb])(&tempFrame);
-			else if (cbCANFrame[8]) (*cbCANFrame[8])(&tempFrame);
-			else 
+			if (cbCANFrame[mb]) 
 			{
-				memcpy((void *)&rx_frame_buff[rx_buffer_head], &tempFrame, sizeof(CAN_FRAME));
-				rx_buffer_head = (rx_buffer_head + 1) % SIZE_RX_BUFFER;
+				caughtFrame = true;
+				(*cbCANFrame[mb])(&tempFrame);
+			}
+			else if (cbCANFrame[8]) 
+			{
+				caughtFrame = true;
+				(*cbCANFrame[8])(&tempFrame);
+			}
+			else
+			{
+				for (int listenerPos = 0; listenerPos < SIZE_LISTENERS; listenerPos++)
+				{
+					thisListener = listener[listenerPos];
+					if (thisListener != NULL)
+					{
+						if (thisListener->callbacksActive & (1 << mb)) 
+						{
+							caughtFrame = true;
+							thisListener->gotFrame(&tempFrame, mb);
+						}
+						else if (thisListener->callbacksActive & 256) 
+						{
+							caughtFrame = true;
+							thisListener->gotFrame(&tempFrame, -1);
+						}
+					}
+				}
+			}
+			if (!caughtFrame) //if none of the callback types caught this frame then queue it in the buffer
+			{
+				uint8_t temp = (rx_buffer_head + 1) % SIZE_RX_BUFFER;
+				if (temp != rx_buffer_tail) 
+				{
+					memcpy((void *)&rx_frame_buff[rx_buffer_head], &tempFrame, sizeof(CAN_FRAME));
+					rx_buffer_head = temp;
+				}
 			}
 			break;
 		case 3: //transmit
@@ -1240,6 +1332,44 @@ void CANRaw::mailbox_int_handler(uint8_t mb, uint32_t ul_status) {
 		}
 	}
 }
+
+CANListener::CANListener()
+{
+	callbacksActive = 0; //none. Bitfield were bits 0-7 are the mailboxes and bit 8 is the general callback
+}
+
+//an empty version so that the linker doesn't complain that no implementation exists.
+void CANListener::gotFrame(CAN_FRAME *frame, int mailbox)
+{
+  
+}
+
+void CANListener::attachMBHandler(uint8_t mailBox)
+{
+	if (mailBox >= 0 && mailBox < 8)
+	{
+		callbacksActive |= (1<<mailBox);
+	}
+}
+
+void CANListener::detachMBHandler(uint8_t mailBox)
+{
+	if (mailBox >= 0 && mailBox < 8)
+	{
+		callbacksActive &= ~(1<<mailBox);
+	}  
+}
+
+void CANListener::attachGeneralHandler()
+{
+	callbacksActive |= 256;
+}
+
+void CANListener::detachGeneralHandler()
+{
+	callbacksActive &= ~256;
+}
+
 
 /**
  * \brief Interrupt dispatchers - Never directly call these
